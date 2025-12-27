@@ -2,7 +2,6 @@ import streamlit as st
 import time, uuid, json, csv, os
 from datetime import datetime
 from random import shuffle
-
 from groq import Groq
 
 # =========================
@@ -11,7 +10,6 @@ from groq import Groq
 LOG_PATH = "logs.csv"
 GOOGLE_FORM_URL = "https://docs.google.com/forms/d/12DYX8F2_2zYPPO2XnwnpPZfoDi8iSea9InGC5oP7DeE/edit"
 
-# Groq model (fast, good enough for rubric ranking)
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 TASK_SETS = {
@@ -49,40 +47,53 @@ MODES = [
 
 LIKERT_MIN, LIKERT_MAX = 1, 7
 
+# Core outcomes we want per mode (short, repeatable)
+MEASURE_ITEMS = [
+    ("trust", "Trust (1–7): I trust the AI ranking in this step."),
+    ("control", "Control (1–7): I felt in control of the final decision."),
+    ("responsibility", "Responsibility (1–7): I feel responsible for the outcome."),
+    ("effort", "Effort (1–7): This step required effort from me."),
+    ("useful", "Usefulness (1–7): The AI ranking was useful."),
+]
 
 # =========================
 # UTIL
 # =========================
+LOG_HEADER = [
+    "timestamp_utc",
+    "participant_id",
+    "mode",
+    "taskset_id",
+    "tasks_json",
+    "ai_order_json",
+    "final_order_json",
+    "time_to_ai_sec",
+    "decision_time_sec",
+    "time_to_submit_sec",
+    "moves_count",
+    "kendall_tau_to_ai",
+    "accepted_ai_as_is",          # NEW: automation bias / reliance
+    "viewed_reasons",             # NEW: explanation exposure
+    "manipulation_check",         # NEW: who decided?
+    "satisfaction_1to7",
+    "trust_1to7",
+    "control_1to7",
+    "responsibility_1to7",
+    "effort_1to7",
+    "useful_1to7",
+]
+
 def ensure_log_header():
     if not os.path.exists(LOG_PATH):
         with open(LOG_PATH, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(
-                [
-                    "timestamp_utc",
-                    "participant_id",
-                    "mode",
-                    "taskset_id",
-                    "tasks_json",
-                    "ai_order_json",
-                    "final_order_json",
-                    "time_to_ai_sec",
-                    "decision_time_sec",
-                    "time_to_submit_sec",
-                    "moves_count",
-                    "kendall_tau_to_ai",
-                    "satisfaction_1to7",
-                    "advisory_responsibility_ack",
-                    "attention_ack_full_mode",
-                ]
-            )
-
+            csv.writer(f).writerow(LOG_HEADER)
 
 def append_log(row):
     ensure_log_header()
     with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
-
+        w = csv.writer(f)
+        w.writerow(row)
+        f.flush()
 
 def kendall_tau_distance(order1, order2):
     pos = {item: i for i, item in enumerate(order2)}
@@ -94,7 +105,6 @@ def kendall_tau_distance(order1, order2):
                 inv += 1
     return inv
 
-
 def move_item(order, idx, direction):
     new_order = order[:]
     j = idx + direction
@@ -102,20 +112,14 @@ def move_item(order, idx, direction):
         new_order[idx], new_order[j] = new_order[j], new_order[idx]
     return new_order
 
-
 def safe_extract_json(text: str) -> dict:
-    """
-    Extract the first {...} JSON object from a model response.
-    Also strips ```json fences if present.
-    """
     raw = (text or "").strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError(f"Model did not return JSON. Raw:\n{raw}")
-    return json.loads(raw[start : end + 1])
-
+    return json.loads(raw[start:end + 1])
 
 # =========================
 # LLM CALL (Groq)
@@ -145,7 +149,6 @@ Tasks:
 {json.dumps(tasks, ensure_ascii=False)}
 """.strip()
 
-    # One call is usually enough; keep temp=0 for consistency
     resp = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
@@ -168,7 +171,6 @@ Tasks:
         raise ValueError(f"Invalid reasons returned: {reasons}")
 
     return {"ranking": ranking, "reasons": reasons}
-
 
 # =========================
 # SESSION STATE INIT
@@ -208,9 +210,14 @@ def init():
     if "moves" not in st.session_state:
         st.session_state.moves = 0
 
+    if "accepted_ai_as_is" not in st.session_state:
+        st.session_state.accepted_ai_as_is = False
+
+    if "viewed_reasons" not in st.session_state:
+        st.session_state.viewed_reasons = False
+
     if "done" not in st.session_state:
         st.session_state.done = False
-
 
 init()
 
@@ -219,7 +226,6 @@ init()
 # =========================
 st.set_page_config(page_title="Task Prioritization Study", layout="centered")
 st.title("Everyday Task Prioritization Study")
-
 st.progress((st.session_state.step + 1) / 3 if not st.session_state.done else 1.0)
 
 st.caption(
@@ -237,8 +243,6 @@ Tie-break: clearer negative consequences if delayed.
 """
     )
 
-st.caption("Note: The AI ranking is a heuristic; please use your judgment.")
-
 with st.sidebar:
     st.write(f"Participant ID: **{st.session_state.participant_id}**")
     if st.button("Reset session"):
@@ -251,7 +255,6 @@ if st.session_state.done:
     st.success("Finished. Please complete the questionnaire.")
     st.write("Participant ID (copy this into the form if needed):")
     st.code(st.session_state.participant_id)
-
     st.link_button("Open questionnaire (Google Form)", GOOGLE_FORM_URL)
     st.stop()
 
@@ -264,17 +267,17 @@ tasks = TASK_SETS[taskset_id]
 st.subheader(f"Step {step+1}/3 — {mode_label}")
 st.caption(f"Task set: {taskset_id}")
 
-# Start timing when the step is first shown
 if st.session_state.t_step_start is None:
     st.session_state.t_step_start = time.time()
 
-# Show tasks
+# Tasks
 st.write("Tasks:")
 for i, t in enumerate(tasks):
     st.write(f"{i}. {t}")
 
-# Generate ranking
-col1, col2 = st.columns([1, 1])
+# Generate / Accept
+col1, col2, col3 = st.columns([1, 1, 1])
+
 with col1:
     if st.button("Generate AI ranking", type="primary", disabled=st.session_state.ai_order is not None):
         try:
@@ -284,6 +287,8 @@ with col1:
             st.session_state.reasons = out["reasons"]
             st.session_state.final_order = out["ranking"][:]
             st.session_state.moves = 0
+            st.session_state.accepted_ai_as_is = False
+            st.session_state.viewed_reasons = False
         except Exception as e:
             st.error(str(e))
 
@@ -294,16 +299,32 @@ with col2:
         st.session_state.final_order = None
         st.session_state.t_ai_shown = None
         st.session_state.moves = 0
+        st.session_state.accepted_ai_as_is = False
+        st.session_state.viewed_reasons = False
+
+with col3:
+    # only meaningful after AI exists
+    if st.button("Accept AI as-is", disabled=st.session_state.ai_order is None):
+        st.session_state.final_order = st.session_state.ai_order[:]
+        st.session_state.accepted_ai_as_is = True
+        st.rerun()
 
 if st.session_state.ai_order is None:
     st.info('Click "Generate AI ranking" to proceed.')
     st.stop()
 
-# AI output
+# AI output (with optional reasons)
 st.divider()
-st.write("AI ranking (with short reasons):")
+show_reasons = st.toggle("Show AI reasons", value=False)
+if show_reasons:
+    st.session_state.viewed_reasons = True
+
+st.write("AI ranking:")
 for rank_pos, idx in enumerate(st.session_state.ai_order, start=1):
-    st.write(f"{rank_pos}. {tasks[idx]} — {st.session_state.reasons[idx]}")
+    if show_reasons:
+        st.write(f"{rank_pos}. {tasks[idx]} — {st.session_state.reasons[idx]}")
+    else:
+        st.write(f"{rank_pos}. {tasks[idx]}")
 
 # Editing rules
 st.divider()
@@ -311,61 +332,72 @@ editable = mode_key in ("advisory", "semi")
 
 if mode_key == "full":
     st.caption("Locked: you cannot change the ranking in this mode.")
-elif mode_key == "advisory":
-    st.caption("You may reorder, then you must explicitly confirm responsibility.")
 else:
-    st.caption("You may reorder if you want, then submit.")
+    st.caption("You may reorder the ranking if you want, then submit.")
 
-# Render final ranking (with edit controls where allowed)
+# Final ranking (editable if allowed)
 st.write("Final ranking:")
 order = st.session_state.final_order
 
 for pos, idx in enumerate(order):
     row = st.columns([8, 1, 1])
     row[0].write(f"{pos+1}. {tasks[idx]}")
-    if row[1].button("↑", key=f"up_{pos}", disabled=(not editable or pos == 0)):
+    if row[1].button("↑", key=f"up_{step}_{pos}", disabled=(not editable or pos == 0)):
         st.session_state.final_order = move_item(order, pos, -1)
         st.session_state.moves += 1
+        st.session_state.accepted_ai_as_is = False
         st.rerun()
-    if row[2].button("↓", key=f"down_{pos}", disabled=(not editable or pos == len(order) - 1)):
+    if row[2].button("↓", key=f"down_{step}_{pos}", disabled=(not editable or pos == len(order) - 1)):
         st.session_state.final_order = move_item(order, pos, +1)
         st.session_state.moves += 1
+        st.session_state.accepted_ai_as_is = False
         st.rerun()
 
-# Edit summary + micro-feedback
 ai_order = st.session_state.ai_order
 final_order = st.session_state.final_order
 kdist_preview = kendall_tau_distance(ai_order, final_order)
-
 st.info(f"Edits: {st.session_state.moves} | Difference from AI: {kdist_preview} (Kendall inversions)")
+
+# -------------------------
+# In-app mini questionnaire (core outcomes)
+# -------------------------
+st.divider()
+st.subheader("Quick questions for this step (10–15 seconds)")
 
 satisfaction = st.slider(
     "Satisfaction (1–7): I am satisfied with the final ranking.",
-    LIKERT_MIN,
-    LIKERT_MAX,
-    4,
-    key=f"satisfaction_{step}",
+    LIKERT_MIN, LIKERT_MAX, 4, key=f"satisfaction_{step}"
 )
 
-# Mode-specific acknowledgements
-advisory_ack = False
-attention_ack = False
+answers = {}
+for key, label in MEASURE_ITEMS:
+    answers[key] = st.slider(label, LIKERT_MIN, LIKERT_MAX, 4, key=f"{key}_{step}")
 
+# Manipulation check (important for validity)
+manipulation = st.radio(
+    "In this step, who made the final decision?",
+    ["Mostly me", "Mostly the AI", "Both equally"],
+    index=0,
+    key=f"manip_{step}"
+)
+
+# Optional acknowledgement differences (kept minimal)
+advisory_ack = True
+attention_ack = True
 if mode_key == "advisory":
-    advisory_ack = st.checkbox("I take responsibility for the final ranking.", key=f"ack_resp_{step}")
-elif mode_key == "full":
+    advisory_ack = st.checkbox("I understand I am responsible for the final decision.", key=f"ack_resp_{step}")
+if mode_key == "full":
     attention_ack = st.checkbox("I have reviewed the ranking.", key=f"ack_seen_{step}")
 
 # Submit
 st.divider()
-submit_label = "Confirm & Next" if editable else "Next"
-
 submit_disabled = False
 if mode_key == "advisory" and not advisory_ack:
     submit_disabled = True
 if mode_key == "full" and not attention_ack:
     submit_disabled = True
 
+submit_label = "Confirm & Next"
 if st.button(submit_label, type="primary", disabled=submit_disabled):
     now = time.time()
     t0 = st.session_state.t_step_start
@@ -377,25 +409,29 @@ if st.button(submit_label, type="primary", disabled=submit_disabled):
 
     kdist = kendall_tau_distance(ai_order, final_order)
 
-    append_log(
-        [
-            datetime.utcnow().isoformat(),
-            st.session_state.participant_id,
-            mode_key,
-            taskset_id,
-            json.dumps(tasks, ensure_ascii=False),
-            json.dumps(ai_order),
-            json.dumps(final_order),
-            round(time_to_ai, 3),
-            round(decision_time, 3),
-            round(time_to_submit, 3),
-            st.session_state.moves,
-            kdist,
-            satisfaction,
-            int(bool(advisory_ack)),
-            int(bool(attention_ack)),
-        ]
-    )
+    append_log([
+        datetime.utcnow().isoformat(),
+        st.session_state.participant_id,
+        mode_key,
+        taskset_id,
+        json.dumps(tasks, ensure_ascii=False),
+        json.dumps(ai_order),
+        json.dumps(final_order),
+        round(time_to_ai, 3),
+        round(decision_time, 3),
+        round(time_to_submit, 3),
+        st.session_state.moves,
+        kdist,
+        int(bool(st.session_state.accepted_ai_as_is)),
+        int(bool(st.session_state.viewed_reasons)),
+        manipulation,
+        satisfaction,
+        answers["trust"],
+        answers["control"],
+        answers["responsibility"],
+        answers["effort"],
+        answers["useful"],
+    ])
 
     # Advance
     st.session_state.step += 1
@@ -405,6 +441,8 @@ if st.button(submit_label, type="primary", disabled=submit_disabled):
     st.session_state.reasons = None
     st.session_state.final_order = None
     st.session_state.moves = 0
+    st.session_state.accepted_ai_as_is = False
+    st.session_state.viewed_reasons = False
 
     if st.session_state.step >= 3:
         st.session_state.done = True
