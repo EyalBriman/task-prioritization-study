@@ -3,25 +3,34 @@
 This repository contains a Streamlit web application for a small-scale
 human–AI interaction study on everyday task prioritization.
 
-Participants interact with the same language model under three conditions
-that differ only in the level of human control:
-1. Advisory (AI proposes, user decides)
-2. Semi-automated (AI proposes, user may modify)
-3. Fully automated (AI decides, no user input)
+Participants interact with the same AI system under three conditions
+that differ **only in the level of human control**:
 
-The AI applies a fixed rubric based on urgency, importance, and deadlines
-across all conditions.
+1. **Advisory** – the AI proposes a ranking; the user decides  
+2. **Semi-automated** – the AI proposes a ranking; the user may modify it  
+3. **Fully automated** – the AI determines the ranking without user input  
+
+Across all conditions, the AI applies a **fixed rubric** based on:
+- urgency,
+- importance,
+- and deadline proximity.
+
+The study measures trust, perceived responsibility, engagement, and
+behavioral differences across control levels.
 
 ---
 
 ## Requirements
+
 - Python 3.9+
-- A Gemini API key (free tier is sufficient)
+- A Groq API key (free tier is sufficient)
+- Internet connection (for API calls)
 
 ---
 
-## Run locally
+## Installation (Local Run)
 
-1. Create and activate a virtual environment:
+1. Clone the repository:
    ```bash
-   python -m venv .venv
+   git clone https://github.com/EyalBriman/task-prioritization-study.git
+   cd task-prioritization-study
