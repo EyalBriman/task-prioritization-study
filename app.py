@@ -2,7 +2,8 @@ import streamlit as st
 import time, uuid, json, csv, os
 from datetime import datetime
 from random import shuffle
-from google import genai
+
+from groq import Groq
 
 # =========================
 # CONFIG
@@ -10,8 +11,8 @@ from google import genai
 LOG_PATH = "logs.csv"
 GOOGLE_FORM_URL = "https://docs.google.com/forms/d/12DYX8F2_2zYPPO2XnwnpPZfoDi8iSea9InGC5oP7DeE/edit"
 
-# Gemini model (choose one that works for your key/tier)
-GEMINI_MODEL = "gemini-2.0-flash"
+# Groq model (fast, good enough for rubric ranking)
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 TASK_SETS = {
     "A": [
@@ -117,14 +118,14 @@ def safe_extract_json(text: str) -> dict:
 
 
 # =========================
-# LLM CALL (Gemini)
+# LLM CALL (Groq)
 # =========================
-def gemini_rank_tasks(tasks):
-    api_key = st.secrets.get("GEMINI_API_KEY", None)
+def groq_rank_tasks(tasks):
+    api_key = st.secrets.get("GROQ_API_KEY", None)
     if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY in Streamlit secrets.")
+        raise RuntimeError("Missing GROQ_API_KEY in Streamlit secrets.")
 
-    client = genai.Client(api_key=api_key)
+    client = Groq(api_key=api_key)
 
     prompt = f"""
 You are ranking tasks using a fixed rubric:
@@ -144,14 +145,18 @@ Tasks:
 {json.dumps(tasks, ensure_ascii=False)}
 """.strip()
 
-    # Try once; if JSON parsing fails, retry with a stricter reminder
-    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    try:
-        data = safe_extract_json(resp.text)
-    except Exception:
-        prompt2 = prompt + "\n\nIMPORTANT: Output JSON ONLY. No prose. No code fences."
-        resp2 = client.models.generate_content(model=GEMINI_MODEL, contents=prompt2)
-        data = safe_extract_json(resp2.text)
+    # One call is usually enough; keep temp=0 for consistency
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "Output JSON only. No prose. No markdown."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+    )
+
+    text = resp.choices[0].message.content
+    data = safe_extract_json(text)
 
     n = len(tasks)
     ranking = data.get("ranking")
@@ -247,10 +252,7 @@ if st.session_state.done:
     st.write("Participant ID (copy this into the form if needed):")
     st.code(st.session_state.participant_id)
 
-    if "PASTE_YOUR_GOOGLE_FORM_LINK_HERE" not in GOOGLE_FORM_URL:
-        st.link_button("Open questionnaire (Google Form)", GOOGLE_FORM_URL)
-    else:
-        st.warning("Add your Google Form link in GOOGLE_FORM_URL in the code.")
+    st.link_button("Open questionnaire (Google Form)", GOOGLE_FORM_URL)
     st.stop()
 
 # Current step context
@@ -276,7 +278,7 @@ col1, col2 = st.columns([1, 1])
 with col1:
     if st.button("Generate AI ranking", type="primary", disabled=st.session_state.ai_order is not None):
         try:
-            out = gemini_rank_tasks(tasks)
+            out = groq_rank_tasks(tasks)
             st.session_state.t_ai_shown = time.time()
             st.session_state.ai_order = out["ranking"]
             st.session_state.reasons = out["reasons"]
@@ -345,7 +347,7 @@ satisfaction = st.slider(
     key=f"satisfaction_{step}",
 )
 
-# Mode-specific acknowledgements (distinct control / responsibility)
+# Mode-specific acknowledgements
 advisory_ack = False
 attention_ack = False
 
@@ -370,7 +372,7 @@ if st.button(submit_label, type="primary", disabled=submit_disabled):
     t_ai = st.session_state.t_ai_shown or t0
 
     time_to_ai = t_ai - t0
-    decision_time = now - t_ai  # time from AI shown to submit
+    decision_time = now - t_ai
     time_to_submit = now - t0
 
     kdist = kendall_tau_distance(ai_order, final_order)
@@ -395,7 +397,7 @@ if st.button(submit_label, type="primary", disabled=submit_disabled):
         ]
     )
 
-    # Advance to next step
+    # Advance
     st.session_state.step += 1
     st.session_state.t_step_start = None
     st.session_state.t_ai_shown = None
