@@ -8,7 +8,7 @@ from google import genai
 # CONFIG
 # =========================
 LOG_PATH = "logs.csv"
-GOOGLE_FORM_URL = "PASTE_YOUR_GOOGLE_FORM_LINK_HERE"
+GOOGLE_FORM_URL = "https://docs.google.com/forms/d/12DYX8F2_2zYPPO2XnwnpPZfoDi8iSea9InGC5oP7DeE/edit"
 
 # Gemini model (choose one that works for your key/tier)
 GEMINI_MODEL = "gemini-2.0-flash"
