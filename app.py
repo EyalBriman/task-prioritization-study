@@ -352,9 +352,8 @@ with right:
                 current_labels,
                 direction="vertical",
                 key=f"dnd_{step}",
-                multi_containers=False,
-                disabled=False,
             )
+
 
             # map labels -> indices
             inv = {v: k for k, v in label_by_idx.items()}
