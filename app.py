@@ -25,7 +25,7 @@ LIKERT_MIN, LIKERT_MAX = 1, 7
 MEASURE_ITEMS = [
     ("trust", "Trust (1–7): I trust the AI ranking in this step."),
     ("control", "Control (1–7): I felt in control of the final decision."),
-    ("responsibility", "Responsibility (1–7): I feel responsible for the outcome."),
+    ("responsibility", "Responsibility (1–7): I feel responsible for the final ranking."),
     ("effort", "Effort (1–7): This step required effort from me."),
     ("useful", "Usefulness (1–7): The AI ranking was useful."),
 ]
@@ -36,7 +36,7 @@ MODES = [
     ("full", "Fully automated: AI decides (locked)"),
 ]
 
-# Broad, population-relevant task pool
+# Broad, population-relevant task pool (no "supervisor")
 TASK_POOL = [
     "Pay a bill that is due soon",
     "Reply to an important message",
@@ -74,10 +74,10 @@ TASK_POOL = [
     "Finish a small errand before stores close",
 ]
 
-TASKS_PER_PARTICIPANT = 5
+TASKS_PER_STEP = 5
 TOTAL_STEPS = 3
 
-# Optional CSV log (JSON download is the main thing)
+# Optional CSV log (you can keep it, but the JSON download is the main thing)
 LOG_PATH = "logs.csv"
 LOG_HEADER = [
     "timestamp_utc",
@@ -137,6 +137,45 @@ def kendall_tau_distance(order1, order2):
                 inv += 1
     return inv
 
+def _sanitize_ranking(ranking, n: int):
+    """
+    Make ranking a valid permutation of 0..n-1.
+    - removes non-ints
+    - removes out-of-range
+    - removes duplicates (keeps first)
+    - appends missing indices
+    """
+    if not isinstance(ranking, list):
+        return list(range(n)), True
+
+    cleaned = []
+    seen = set()
+    for x in ranking:
+        if isinstance(x, bool):
+            continue  # bool is int subclass; ignore
+        if isinstance(x, int) and 0 <= x < n and x not in seen:
+            cleaned.append(x)
+            seen.add(x)
+
+    missing = [i for i in range(n) if i not in seen]
+    fixed = cleaned + missing
+
+    # repaired if not exactly a clean permutation
+    repaired = (len(fixed) != n) or (fixed != ranking) or (sorted(fixed) != list(range(n)))
+    return fixed, repaired
+
+def _sanitize_reasons(reasons, n: int):
+    """
+    Ensure reasons is a list of length n, aligned to task index.
+    """
+    if not isinstance(reasons, list):
+        return [""] * n, True
+    fixed = [str(r) for r in reasons[:n]]
+    if len(fixed) < n:
+        fixed.extend([""] * (n - len(fixed)))
+    repaired = (len(fixed) != n) or (fixed != reasons)
+    return fixed, repaired
+
 # =========================
 # GROQ
 # =========================
@@ -146,6 +185,7 @@ def groq_rank_tasks(tasks):
         raise RuntimeError("Missing GROQ_API_KEY in Streamlit secrets.")
 
     client = Groq(api_key=api_key)
+    n = len(tasks)
 
     prompt = f"""
 You are ranking tasks using a fixed rubric:
@@ -155,16 +195,21 @@ You are ranking tasks using a fixed rubric:
 Resolve ties by choosing the task with clearer negative consequences if delayed.
 
 Return ONLY valid JSON (no markdown, no extra text).
+IMPORTANT:
+- "ranking" MUST be a permutation containing EVERY integer 0..{n-1} exactly once.
+- "reasons" MUST be a list of length {n}, where reasons[i] explains task i.
+
 JSON schema:
 {{
-  "ranking": [int, ...],   // permutation of 0..{len(tasks)-1}, highest priority first
-  "reasons": [string, ...] // length {len(tasks)}; reasons[i] max 12 words
+  "ranking": [int, ...],
+  "reasons": [string, ...]
 }}
 
-Tasks:
+Tasks (index = task id):
 {json.dumps(tasks, ensure_ascii=False)}
 """.strip()
 
+    # Attempt 1
     resp = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
@@ -173,20 +218,38 @@ Tasks:
         ],
         temperature=0.0,
     )
-
-    text = resp.choices[0].message.content
-    data = safe_extract_json(text)
-
-    n = len(tasks)
+    data = safe_extract_json(resp.choices[0].message.content)
     ranking = data.get("ranking")
     reasons = data.get("reasons")
 
-    if not isinstance(ranking, list) or sorted(ranking) != list(range(n)):
-        raise ValueError(f"Invalid ranking returned: {ranking}")
-    if not isinstance(reasons, list) or len(reasons) != n:
-        raise ValueError(f"Invalid reasons returned: {reasons}")
+    fixed_ranking, repaired_rank = _sanitize_ranking(ranking, n)
+    fixed_reasons, _ = _sanitize_reasons(reasons, n)
 
-    return {"ranking": ranking, "reasons": reasons}
+    # Retry once if ranking is invalid (keeps experiment cleaner than pure repair)
+    if repaired_rank:
+        retry_prompt = prompt + "\n\nYour previous ranking was invalid. Return a correct permutation now."
+        resp2 = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": "Output JSON only. No prose. No markdown."},
+                {"role": "user", "content": retry_prompt},
+            ],
+            temperature=0.0,
+        )
+        data2 = safe_extract_json(resp2.choices[0].message.content)
+        ranking2 = data2.get("ranking")
+        reasons2 = data2.get("reasons")
+
+        fixed_ranking2, repaired_rank2 = _sanitize_ranking(ranking2, n)
+        fixed_reasons2, _ = _sanitize_reasons(reasons2, n)
+
+        if not repaired_rank2:
+            fixed_ranking, fixed_reasons = fixed_ranking2, fixed_reasons2
+        else:
+            # keep repaired attempt 1 result
+            pass
+
+    return {"ranking": fixed_ranking, "reasons": fixed_reasons}
 
 # =========================
 # SESSION INIT
@@ -203,11 +266,11 @@ def init():
     if "step" not in st.session_state:
         st.session_state.step = 0
 
-    # Fixed tasks for the participant (same in all 3 steps)
-    if "tasks_for_participant" not in st.session_state:
-        st.session_state.tasks_for_participant = None
+    # Tasks sampled per step, fixed per participant+step
+    if "tasks_by_step" not in st.session_state:
+        st.session_state.tasks_by_step = {}
 
-    # Per-step state
+    # Per-step AI + user state
     if "t_step_start" not in st.session_state:
         st.session_state.t_step_start = None
     if "t_ai_shown" not in st.session_state:
@@ -219,11 +282,11 @@ def init():
     if "user_order" not in st.session_state:
         st.session_state.user_order = None
 
-    # Advisory gating
+    # Advisory gating: require explicit confirmation of initial ranking
     if "advisory_ready_for_ai" not in st.session_state:
         st.session_state.advisory_ready_for_ai = False
 
-    # Track AI generation per step (for timing/logging)
+    # Track which step has AI generated (robust fix)
     if "ai_generated_step_idx" not in st.session_state:
         st.session_state.ai_generated_step_idx = None
 
@@ -232,12 +295,11 @@ def init():
     if "accepted_ai_as_is" not in st.session_state:
         st.session_state.accepted_ai_as_is = False
 
-    # Collect everything for JSON download
+    # Collect everything in-memory so user can download at end
     if "records" not in st.session_state:
         st.session_state.records = {
             "participant_id": st.session_state.participant_id,
             "mode_order": None,
-            "tasks": None,
             "steps": []
         }
 
@@ -251,19 +313,14 @@ if st.session_state.records["mode_order"] is None:
     st.session_state.records["mode_order"] = [m[0] for m in st.session_state.mode_order]
 
 # =========================
-# TASKS (fixed for participant)
+# TASKS per step
 # =========================
-def get_tasks_for_participant(pid: str):
-    if st.session_state.tasks_for_participant is not None:
-        return st.session_state.tasks_for_participant
-
-    rng = random.Random(f"{pid}-TASKSET")
-    tasks = rng.sample(TASK_POOL, TASKS_PER_PARTICIPANT)
-    st.session_state.tasks_for_participant = tasks
-
-    if st.session_state.records.get("tasks") is None:
-        st.session_state.records["tasks"] = tasks
-
+def get_tasks_for_step(pid: str, step_idx: int):
+    if step_idx in st.session_state.tasks_by_step:
+        return st.session_state.tasks_by_step[step_idx]
+    rng = random.Random(f"{pid}-{step_idx}")
+    tasks = rng.sample(TASK_POOL, TASKS_PER_STEP)
+    st.session_state.tasks_by_step[step_idx] = tasks
     return tasks
 
 # =========================
@@ -282,7 +339,7 @@ def ensure_ai_generated(tasks, step_idx):
 # UI
 # =========================
 st.title("Everyday Task Prioritization Study")
-st.caption("You will complete three steps. The same 5 tasks are used in all steps; only control level changes.")
+st.caption("You will complete three steps. Each step uses 5 tasks sampled from a broad pool. Only control level changes.")
 
 with st.expander("Rubric used by the AI (same in all modes)", expanded=False):
     st.markdown(
@@ -305,6 +362,7 @@ with st.sidebar:
 # DONE screen: download data
 if st.session_state.done:
     st.success("Finished. Download your data file and send it to the researcher.")
+
     payload = st.session_state.records
     json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
@@ -314,6 +372,7 @@ if st.session_state.done:
         file_name=f"task_study_{payload['participant_id']}.json",
         mime="application/json",
     )
+
     st.write("Your Participant ID:")
     st.code(payload["participant_id"])
     st.stop()
@@ -321,7 +380,7 @@ if st.session_state.done:
 # Step context
 step_idx = st.session_state.step
 mode_key, mode_label = st.session_state.mode_order[step_idx]
-tasks = get_tasks_for_participant(st.session_state.participant_id)
+tasks = get_tasks_for_step(st.session_state.participant_id, step_idx)
 n = len(tasks)
 
 st.progress((step_idx + 1) / TOTAL_STEPS)
@@ -334,16 +393,13 @@ if st.session_state.t_step_start is None:
 if st.session_state.user_order is None:
     st.session_state.user_order = list(range(n))
 
-# Auto-generate AI for semi + full
+# Auto-generate AI for semi + full (NO button)
 if mode_key in ("semi", "full"):
     try:
         ensure_ai_generated(tasks, step_idx)
-        # Prefill semi with AI once when step loads
-        if mode_key == "semi" and st.session_state.ai_order is not None:
-            # only prefill if user hasn't already changed it this step
-            if st.session_state.user_order == list(range(n)):
-                st.session_state.user_order = st.session_state.ai_order[:]
-                st.session_state.accepted_ai_as_is = True
+        if mode_key == "semi" and (st.session_state.user_order == list(range(n))):
+            st.session_state.user_order = st.session_state.ai_order[:]
+            st.session_state.accepted_ai_as_is = True
     except Exception as e:
         st.error(str(e))
 
@@ -414,6 +470,7 @@ with right:
     )
 
     if not editable:
+        # Full mode: lock to AI
         if st.session_state.ai_order is None:
             st.info("Waiting for AI ranking...")
         else:
@@ -421,22 +478,20 @@ with right:
             for pos, idx in enumerate(st.session_state.user_order, start=1):
                 st.markdown(f"<div class='card'>{pos}. {tasks[idx]}</div>", unsafe_allow_html=True)
     else:
+        # Editable: drag & drop if available, else up/down
         if HAS_DND:
             label_by_idx = {i: f"{i}. {tasks[i]}" for i in range(n)}
             current_labels = [label_by_idx[i] for i in st.session_state.user_order]
 
-            try:
-                sorted_labels = sort_items(
-                    current_labels,
-                    direction="vertical",
-                    key=f"dnd_{step_idx}",
-                )
-                inv = {v: k for k, v in label_by_idx.items()}
-                st.session_state.user_order = [inv[x] for x in sorted_labels]
-            except Exception:
-                HAS_DND = False
+            sorted_labels = sort_items(
+                current_labels,
+                direction="vertical",
+                key=f"dnd_{step_idx}",
+            )
 
-        if not HAS_DND:
+            inv = {v: k for k, v in label_by_idx.items()}
+            st.session_state.user_order = [inv[x] for x in sorted_labels]
+        else:
             order = st.session_state.user_order
             for pos, idx in enumerate(order):
                 row = st.columns([8, 1, 1])
@@ -452,13 +507,14 @@ with right:
                     st.session_state.accepted_ai_as_is = False
                     st.rerun()
 
+        # Advisory: explicit button to reveal AI
         if mode_key == "advisory" and not st.session_state.advisory_ready_for_ai:
             if st.button("Reveal AI advice (I finished my initial ranking)"):
                 st.session_state.advisory_ready_for_ai = True
                 st.rerun()
 
 # -------------------------
-# Status
+# Status: difference from AI
 # -------------------------
 st.divider()
 ai_order = st.session_state.ai_order
@@ -476,6 +532,7 @@ else:
 # Questionnaire
 # -------------------------
 st.subheader("Quick questions for this step (10–15 seconds)")
+
 satisfaction = st.slider(
     "Satisfaction (1–7): I am satisfied with the final ranking.",
     LIKERT_MIN, LIKERT_MAX, 4, key=f"satisfaction_{step_idx}"
@@ -523,6 +580,7 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
     kdist = kendall_tau_distance(ai_order, final_order)
     accepted = int(bool(final_order == ai_order))
 
+    # Optional CSV logging
     append_log([
         datetime.utcnow().isoformat(),
         st.session_state.participant_id,
@@ -547,6 +605,7 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
         answers["useful"],
     ])
 
+    # Save into downloadable participant JSON
     st.session_state.records["steps"].append({
         "timestamp_utc": datetime.utcnow().isoformat(),
         "step": step_idx + 1,
@@ -570,9 +629,10 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
         "useful_1to7": answers["useful"],
     })
 
+    # Advance
     st.session_state.step += 1
 
-    # Reset per-step UI state (keep participant tasks!)
+    # Reset per-step UI state
     st.session_state.t_step_start = None
     st.session_state.t_ai_shown = None
     st.session_state.ai_order = None
