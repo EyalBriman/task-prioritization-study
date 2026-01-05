@@ -2,13 +2,13 @@ import streamlit as st
 import time, uuid, json, csv, os
 from datetime import datetime
 from groq import Groq
+import random
 
 # -------------------------
 # OPTIONAL: Drag & Drop
 # -------------------------
 HAS_DND = False
 try:
-    # pip install streamlit-sortables
     from streamlit_sortables import sort_items
     HAS_DND = True
 except Exception:
@@ -19,26 +19,7 @@ except Exception:
 # =========================
 st.set_page_config(page_title="Task Prioritization Study", layout="wide")
 
-LOG_PATH = "logs.csv"
-GOOGLE_FORM_URL = "https://docs.google.com/forms/d/12DYX8F2_2zYPPO2XnwnpPZfoDi8iSea9InGC5oP7DeE/edit"
 GROQ_MODEL = "llama-3.1-8b-instant"
-
-# 1) FIXED TASK LIST across all 3 modes (your Hebrew comment #1)
-TASKS_FIXED = [
-    "Submit assignment due tomorrow 23:59",
-    "Reply to important email from supervisor",
-    "Buy groceries for dinner tonight",
-    "Book dentist appointment (no deadline)",
-    "Call bank about a charge (this week)",
-    "Prepare slides for meeting in 2 days",
-]
-
-# Modes: same as before, but we will enforce clearer flow differences
-MODES = [
-    ("advisory", "Advisory: You rank first, then AI advises"),
-    ("semi", "Semi-automated: AI ranks first, you may modify"),
-    ("full", "Fully automated: AI decides (locked)"),
-]
 
 LIKERT_MIN, LIKERT_MAX = 1, 7
 MEASURE_ITEMS = [
@@ -49,9 +30,59 @@ MEASURE_ITEMS = [
     ("useful", "Usefulness (1–7): The AI ranking was useful."),
 ]
 
+MODES = [
+    ("advisory", "Advisory: You rank first, then AI advises"),
+    ("semi", "Semi-automated: AI ranks first, you may modify"),
+    ("full", "Fully automated: AI decides (locked)"),
+]
+
+# Broad, population-relevant task pool (no "supervisor")
+TASK_POOL = [
+    "Pay a bill that is due soon",
+    "Reply to an important message",
+    "Buy groceries for today or tomorrow",
+    "Book a medical appointment (no deadline)",
+    "Call the bank about a suspicious charge",
+    "Prepare for a meeting/class in 2 days",
+    "Submit a form/application before a deadline",
+    "Pick up a package before closing time today",
+    "Do laundry needed for tomorrow",
+    "Schedule a repair (car/phone/home) this month",
+    "Renew a service/subscription before it expires",
+    "Refill an essential medication/prescription",
+    "Plan a study/work session for an upcoming exam/project",
+    "Confirm travel or hotel details this week",
+    "Pack essentials for tomorrow morning",
+    "Clean the kitchen / take out trash today",
+    "Call a family member back (no deadline)",
+    "Send an RSVP by tomorrow",
+    "Prepare dinner plan for tonight",
+    "Organize documents needed for an appointment",
+    "Respond to a request that has consequences if late",
+    "Fix a tech issue blocking work (soon)",
+    "Buy a household essential needed soon",
+    "Return an item before the return window closes",
+    "Review terms/contract before making a decision",
+    "Prepare materials for a presentation",
+    "Handle a parking/municipal issue this week",
+    "Follow up on a delayed service ticket",
+    "Arrange childcare/pet care for an upcoming day",
+    "Confirm an appointment time/location",
+    "Send a required email/message today",
+    "Pay rent / transfer money on time",
+    "Update a document due in a few days",
+    "Finish a small errand before stores close",
+]
+
+TASKS_PER_STEP = 5
+TOTAL_STEPS = 3
+
+# Optional CSV log (you can keep it, but the JSON download is the main thing)
+LOG_PATH = "logs.csv"
 LOG_HEADER = [
     "timestamp_utc",
     "participant_id",
+    "step",
     "mode",
     "tasks_json",
     "ai_order_json",
@@ -84,6 +115,9 @@ def append_log(row):
         w.writerow(row)
         f.flush()
 
+# =========================
+# UTIL
+# =========================
 def safe_extract_json(text: str) -> dict:
     raw = (text or "").strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -103,6 +137,9 @@ def kendall_tau_distance(order1, order2):
                 inv += 1
     return inv
 
+# =========================
+# GROQ
+# =========================
 def groq_rank_tasks(tasks):
     api_key = st.secrets.get("GROQ_API_KEY", None)
     if not api_key:
@@ -134,7 +171,7 @@ Tasks:
             {"role": "system", "content": "Output JSON only. No prose. No markdown."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.0,
+        temperature=0.0,  # keep deterministic for a clean experiment
     )
 
     text = resp.choices[0].message.content
@@ -159,8 +196,6 @@ def init():
         st.session_state.participant_id = str(uuid.uuid4())[:8]
 
     if "mode_order" not in st.session_state:
-        # keep your counterbalancing, but only across modes now (tasks are fixed)
-        import random
         m = MODES[:]
         random.shuffle(m)
         st.session_state.mode_order = m
@@ -168,45 +203,81 @@ def init():
     if "step" not in st.session_state:
         st.session_state.step = 0
 
-    # timing
+    # Tasks sampled per step, fixed per participant+step
+    if "tasks_by_step" not in st.session_state:
+        st.session_state.tasks_by_step = {}
+
+    # Per-step AI + user state
     if "t_step_start" not in st.session_state:
         st.session_state.t_step_start = None
     if "t_ai_shown" not in st.session_state:
         st.session_state.t_ai_shown = None
-
-    # AI + reasons
     if "ai_order" not in st.session_state:
         st.session_state.ai_order = None
     if "reasons" not in st.session_state:
         st.session_state.reasons = None
-
-    # user ranking (list of indices)
     if "user_order" not in st.session_state:
         st.session_state.user_order = None
 
-    # bookkeeping
+    # Advisory gating: require explicit confirmation of initial ranking
+    if "advisory_ready_for_ai" not in st.session_state:
+        st.session_state.advisory_ready_for_ai = False
+
+    # Track which step has AI generated (robust fix for “semi still requires button”)
+    if "ai_generated_step_idx" not in st.session_state:
+        st.session_state.ai_generated_step_idx = None
+
     if "viewed_reasons" not in st.session_state:
         st.session_state.viewed_reasons = False
     if "accepted_ai_as_is" not in st.session_state:
         st.session_state.accepted_ai_as_is = False
 
-    # advisory-specific: force user to rank BEFORE AI appears
-    if "user_ranked_before_ai" not in st.session_state:
-        st.session_state.user_ranked_before_ai = False
+    # Collect everything in-memory so user can download at end
+    if "records" not in st.session_state:
+        st.session_state.records = {
+            "participant_id": st.session_state.participant_id,
+            "mode_order": None,
+            "steps": []
+        }
 
     if "done" not in st.session_state:
         st.session_state.done = False
 
 init()
 
+# Store mode order once
+if st.session_state.records["mode_order"] is None:
+    st.session_state.records["mode_order"] = [m[0] for m in st.session_state.mode_order]
+
 # =========================
-# UI (HEADER)
+# TASKS per step
+# =========================
+def get_tasks_for_step(pid: str, step_idx: int):
+    if step_idx in st.session_state.tasks_by_step:
+        return st.session_state.tasks_by_step[step_idx]
+    rng = random.Random(f"{pid}-{step_idx}")
+    tasks = rng.sample(TASK_POOL, TASKS_PER_STEP)
+    st.session_state.tasks_by_step[step_idx] = tasks
+    return tasks
+
+# =========================
+# AI generation
+# =========================
+def ensure_ai_generated(tasks, step_idx):
+    # Generate AI once per step
+    if st.session_state.ai_generated_step_idx == step_idx and st.session_state.ai_order is not None:
+        return
+    out = groq_rank_tasks(tasks)
+    st.session_state.t_ai_shown = time.time()
+    st.session_state.ai_order = out["ranking"]
+    st.session_state.reasons = out["reasons"]
+    st.session_state.ai_generated_step_idx = step_idx
+
+# =========================
+# UI
 # =========================
 st.title("Everyday Task Prioritization Study")
-st.caption(
-    "Same tasks every time. Only the level of human control changes.\n"
-    "AI rubric is constant: urgency, importance, deadlines."
-)
+st.caption("You will complete three steps. Each step uses 5 tasks sampled from a broad pool. Only control level changes.")
 
 with st.expander("Rubric used by the AI (same in all modes)", expanded=False):
     st.markdown(
@@ -226,34 +297,51 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# Finished screen
+# DONE screen: download data
 if st.session_state.done:
-    st.success("Finished. Please complete the questionnaire.")
-    st.write("Participant ID (copy this into the form if needed):")
-    st.code(st.session_state.participant_id)
-    st.link_button("Open questionnaire (Google Form)", GOOGLE_FORM_URL)
+    st.success("Finished. Download your data file and send it to the researcher.")
+
+    payload = st.session_state.records
+    json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+    st.download_button(
+        "Download your experiment data (JSON)",
+        data=json_bytes,
+        file_name=f"task_study_{payload['participant_id']}.json",
+        mime="application/json",
+    )
+
+    st.write("Your Participant ID:")
+    st.code(payload["participant_id"])
     st.stop()
 
 # Step context
-step = st.session_state.step
-mode_key, mode_label = st.session_state.mode_order[step]
-tasks = TASKS_FIXED
+step_idx = st.session_state.step
+mode_key, mode_label = st.session_state.mode_order[step_idx]
+tasks = get_tasks_for_step(st.session_state.participant_id, step_idx)
 n = len(tasks)
 
-st.progress((step + 1) / 3)
-
-st.subheader(f"Step {step+1}/3 — {mode_label}")
+st.progress((step_idx + 1) / TOTAL_STEPS)
+st.subheader(f"Step {step_idx+1}/{TOTAL_STEPS} — {mode_label}")
 
 if st.session_state.t_step_start is None:
     st.session_state.t_step_start = time.time()
 
-# Initialize user order (default: identity)
+# Init user order for step
 if st.session_state.user_order is None:
     st.session_state.user_order = list(range(n))
 
-# -------------------------
-# Layout: side-by-side
-# -------------------------
+# Auto-generate AI for semi + full (NO button)
+if mode_key in ("semi", "full"):
+    try:
+        ensure_ai_generated(tasks, step_idx)
+        if mode_key == "semi" and (st.session_state.accepted_ai_as_is is False) and (st.session_state.user_order == list(range(n))):
+            # Prefill once when step first loads (only if user hasn't changed anything)
+            st.session_state.user_order = st.session_state.ai_order[:]
+            st.session_state.accepted_ai_as_is = True
+    except Exception as e:
+        st.error(str(e))
+
 left, right = st.columns([1, 1], gap="large")
 
 # -------------------------
@@ -262,61 +350,48 @@ left, right = st.columns([1, 1], gap="large")
 with left:
     st.markdown("### AI recommendation")
 
-    # Advisory: AI should not appear until user ranks first (your Hebrew comment #2 + #3)
-    advisory_blocked = (mode_key == "advisory" and not st.session_state.user_ranked_before_ai)
-
-    if st.session_state.ai_order is None:
-        if advisory_blocked:
-            st.info("In Advisory mode, first rank the tasks on the right. Then you can reveal the AI.")
-        else:
+    if mode_key == "advisory" and not st.session_state.advisory_ready_for_ai:
+        st.info("Advisory: first rank tasks on the right, then click “Reveal AI advice”.")
+    else:
+        if st.session_state.ai_order is None:
             if st.button("Generate AI ranking", type="primary"):
                 try:
-                    out = groq_rank_tasks(tasks)
-                    st.session_state.t_ai_shown = time.time()
-                    st.session_state.ai_order = out["ranking"]
-                    st.session_state.reasons = out["reasons"]
-                    # Semi mode: prefill user's ranking with AI ranking (clear distinction)
-                    if mode_key == "semi":
-                        st.session_state.user_order = out["ranking"][:]
-                        st.session_state.accepted_ai_as_is = True
+                    ensure_ai_generated(tasks, step_idx)
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
-    else:
-        show_reasons = st.toggle("Show AI reasons", value=False, key=f"show_reasons_{step}")
-        if show_reasons:
-            st.session_state.viewed_reasons = True
-
-        for rank_pos, idx in enumerate(st.session_state.ai_order, start=1):
+        else:
+            show_reasons = st.toggle("Show AI reasons", value=False, key=f"show_reasons_{step_idx}")
             if show_reasons:
-                st.write(f"{rank_pos}. {tasks[idx]} — {st.session_state.reasons[idx]}")
-            else:
-                st.write(f"{rank_pos}. {tasks[idx]}")
+                st.session_state.viewed_reasons = True
 
-        # Convenience button (still logs accepted_ai_as_is)
-        if mode_key in ("advisory", "semi"):
-            if st.button("Copy AI ranking to my ranking"):
-                st.session_state.user_order = st.session_state.ai_order[:]
-                st.session_state.accepted_ai_as_is = True
-                st.rerun()
+            for rank_pos, idx in enumerate(st.session_state.ai_order, start=1):
+                if show_reasons:
+                    st.write(f"{rank_pos}. {tasks[idx]} — {st.session_state.reasons[idx]}")
+                else:
+                    st.write(f"{rank_pos}. {tasks[idx]}")
+
+            if mode_key in ("advisory", "semi"):
+                if st.button("Copy AI ranking to my ranking"):
+                    st.session_state.user_order = st.session_state.ai_order[:]
+                    st.session_state.accepted_ai_as_is = True
+                    st.rerun()
 
 # -------------------------
-# RIGHT: User ranking (drag & drop)
+# RIGHT: User ranking
 # -------------------------
 with right:
     st.markdown("### Your ranking")
 
-    # Explain the control difference plainly (divide-control heuristic)
     if mode_key == "advisory":
-        st.caption("You must rank first. Then the AI can advise. You decide the final ranking.")
+        st.caption("You rank first. Then you may view AI advice. You decide final ranking.")
     elif mode_key == "semi":
-        st.caption("AI pre-fills the ranking. You may modify it before submitting.")
+        st.caption("AI ranked first and prefilled. You may modify before submitting.")
     else:
-        st.caption("Locked. AI determines the final ranking in this mode.")
+        st.caption("Locked: AI determines final ranking in this mode.")
 
     editable = (mode_key != "full")
 
-    # White-card style
     st.markdown(
         """
         <style>
@@ -334,101 +409,94 @@ with right:
     )
 
     if not editable:
-        # Full automation: user's ranking = AI ranking (locked)
+        # Full mode: lock to AI
         if st.session_state.ai_order is None:
-            st.info("Generate AI ranking on the left to proceed.")
+            st.info("Waiting for AI ranking...")
         else:
             st.session_state.user_order = st.session_state.ai_order[:]
             for pos, idx in enumerate(st.session_state.user_order, start=1):
                 st.markdown(f"<div class='card'>{pos}. {tasks[idx]}</div>", unsafe_allow_html=True)
     else:
-        # Drag & Drop if available; else fallback to up/down
+        # Editable: drag & drop if available, else up/down
         if HAS_DND:
-            # sort_items expects list of strings; map back to indices
             label_by_idx = {i: f"{i}. {tasks[i]}" for i in range(n)}
             current_labels = [label_by_idx[i] for i in st.session_state.user_order]
 
-            sorted_labels = sort_items(
-                current_labels,
-                direction="vertical",
-                key=f"dnd_{step}",
-            )
+            try:
+                sorted_labels = sort_items(
+                    current_labels,
+                    direction="vertical",
+                    key=f"dnd_{step_idx}",
+                )
+                inv = {v: k for k, v in label_by_idx.items()}
+                st.session_state.user_order = [inv[x] for x in sorted_labels]
+            except Exception:
+                HAS_DND = False
 
-
-            # map labels -> indices
-            inv = {v: k for k, v in label_by_idx.items()}
-            new_order = [inv[x] for x in sorted_labels]
-            st.session_state.user_order = new_order
-
-            # Advisory: as soon as they have interacted, allow AI reveal
-            if mode_key == "advisory":
-                st.session_state.user_ranked_before_ai = True
-
-            # accepted_ai_as_is flag (only meaningful after AI exists)
-            if st.session_state.ai_order is not None:
-                st.session_state.accepted_ai_as_is = (st.session_state.user_order == st.session_state.ai_order)
-
-        else:
-            # Fallback: your original up/down buttons
+        if not HAS_DND:
             order = st.session_state.user_order
             for pos, idx in enumerate(order):
                 row = st.columns([8, 1, 1])
                 row[0].write(f"{pos+1}. {tasks[idx]}")
-                if row[1].button("↑", key=f"up_{step}_{pos}", disabled=(pos == 0)):
+                if row[1].button("↑", key=f"up_{step_idx}_{pos}", disabled=(pos == 0)):
                     order[pos-1], order[pos] = order[pos], order[pos-1]
                     st.session_state.user_order = order
-                    if mode_key == "advisory":
-                        st.session_state.user_ranked_before_ai = True
+                    st.session_state.accepted_ai_as_is = False
                     st.rerun()
-                if row[2].button("↓", key=f"down_{step}_{pos}", disabled=(pos == len(order)-1)):
+                if row[2].button("↓", key=f"down_{step_idx}_{pos}", disabled=(pos == len(order) - 1)):
                     order[pos+1], order[pos] = order[pos], order[pos+1]
                     st.session_state.user_order = order
-                    if mode_key == "advisory":
-                        st.session_state.user_ranked_before_ai = True
+                    st.session_state.accepted_ai_as_is = False
                     st.rerun()
 
+        # Advisory: explicit button to reveal AI (prevents accidental reveal)
+        if mode_key == "advisory" and not st.session_state.advisory_ready_for_ai:
+            if st.button("Reveal AI advice (I finished my initial ranking)"):
+                st.session_state.advisory_ready_for_ai = True
+                st.rerun()
+
 # -------------------------
-# Compute distances + show small status
+# Status: difference from AI
 # -------------------------
 st.divider()
-
 ai_order = st.session_state.ai_order
 final_order = st.session_state.user_order
 
 if ai_order is None:
-    st.info("Next: Generate AI ranking (left).")
+    st.info("AI ranking not generated yet.")
 else:
-    kdist_preview = kendall_tau_distance(ai_order, final_order)
-    st.info(f"Difference from AI: {kdist_preview} (Kendall inversions)")
+    kdist = kendall_tau_distance(ai_order, final_order)
+    moves_count = sum(1 for i in range(n) if final_order[i] != ai_order[i])
+    st.info(f"Difference from AI: {kdist} (Kendall inversions) | Position mismatches: {moves_count}")
+
+    st.session_state.accepted_ai_as_is = (final_order == ai_order)
 
 # -------------------------
-# In-app questionnaire
+# Questionnaire
 # -------------------------
 st.subheader("Quick questions for this step (10–15 seconds)")
-
 satisfaction = st.slider(
     "Satisfaction (1–7): I am satisfied with the final ranking.",
-    LIKERT_MIN, LIKERT_MAX, 4, key=f"satisfaction_{step}"
+    LIKERT_MIN, LIKERT_MAX, 4, key=f"satisfaction_{step_idx}"
 )
 
 answers = {}
 for key, label in MEASURE_ITEMS:
-    answers[key] = st.slider(label, LIKERT_MIN, LIKERT_MAX, 4, key=f"{key}_{step}")
+    answers[key] = st.slider(label, LIKERT_MIN, LIKERT_MAX, 4, key=f"{key}_{step_idx}")
 
 manipulation = st.radio(
     "In this step, who made the final decision?",
     ["Mostly me", "Mostly the AI", "Both equally"],
     index=0,
-    key=f"manip_{step}"
+    key=f"manip_{step_idx}"
 )
 
-# Advisory / Full acknowledgement (minimal)
 advisory_ack = True
 attention_ack = True
 if mode_key == "advisory":
-    advisory_ack = st.checkbox("I understand I am responsible for the final decision.", key=f"ack_resp_{step}")
+    advisory_ack = st.checkbox("I understand I am responsible for the final decision.", key=f"ack_resp_{step_idx}")
 if mode_key == "full":
-    attention_ack = st.checkbox("I have reviewed the ranking.", key=f"ack_seen_{step}")
+    attention_ack = st.checkbox("I have reviewed the ranking.", key=f"ack_seen_{step_idx}")
 
 # -------------------------
 # Submit
@@ -438,9 +506,7 @@ if mode_key == "advisory" and not advisory_ack:
     submit_disabled = True
 if mode_key == "full" and not attention_ack:
     submit_disabled = True
-
-# Also prevent submit if AI not generated yet (because we need ai_order for logging/comparison)
-if st.session_state.ai_order is None:
+if ai_order is None:
     submit_disabled = True
 
 if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
@@ -452,15 +518,15 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
     decision_time = now - t_ai
     time_to_submit = now - t0
 
-    # moves_count: how many positions differ from AI (simple, stable)
     moves_count = sum(1 for i in range(n) if final_order[i] != ai_order[i])
-
     kdist = kendall_tau_distance(ai_order, final_order)
     accepted = int(bool(final_order == ai_order))
 
+    # Optional CSV logging
     append_log([
         datetime.utcnow().isoformat(),
         st.session_state.participant_id,
+        step_idx + 1,
         mode_key,
         json.dumps(tasks, ensure_ascii=False),
         json.dumps(ai_order),
@@ -481,20 +547,45 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
         answers["useful"],
     ])
 
-    # Advance to next mode
+    # Save into downloadable participant JSON
+    st.session_state.records["steps"].append({
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "step": step_idx + 1,
+        "mode": mode_key,
+        "tasks": tasks,
+        "ai_order": ai_order,
+        "final_order": final_order,
+        "time_to_ai_sec": round(time_to_ai, 3),
+        "decision_time_sec": round(decision_time, 3),
+        "time_to_submit_sec": round(time_to_submit, 3),
+        "moves_count": moves_count,
+        "kendall_tau_to_ai": kdist,
+        "accepted_ai_as_is": bool(accepted),
+        "viewed_reasons": bool(st.session_state.viewed_reasons),
+        "manipulation_check": manipulation,
+        "satisfaction_1to7": satisfaction,
+        "trust_1to7": answers["trust"],
+        "control_1to7": answers["control"],
+        "responsibility_1to7": answers["responsibility"],
+        "effort_1to7": answers["effort"],
+        "useful_1to7": answers["useful"],
+    })
+
+    # Advance
     st.session_state.step += 1
 
-    # Reset per-step state
+    # Reset per-step UI state
     st.session_state.t_step_start = None
     st.session_state.t_ai_shown = None
     st.session_state.ai_order = None
     st.session_state.reasons = None
-    st.session_state.user_order = list(range(n))
+    st.session_state.user_order = None
     st.session_state.viewed_reasons = False
     st.session_state.accepted_ai_as_is = False
-    st.session_state.user_ranked_before_ai = False
+    st.session_state.advisory_ready_for_ai = False
+    st.session_state.ai_generated_step_idx = None
 
-    if st.session_state.step >= 3:
+    if st.session_state.step >= TOTAL_STEPS:
         st.session_state.done = True
 
     st.rerun()
