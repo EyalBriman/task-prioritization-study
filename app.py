@@ -7,9 +7,11 @@ import random
 # -------------------------
 # OPTIONAL: Drag & Drop
 # -------------------------
+# If you want drag-and-drop, add to requirements.txt:
+#   streamlit-sortables>=0.3.1
 HAS_DND = False
 try:
-    from streamlit_sortables import sort_items
+    from streamlit_sortables import sort_items  # type: ignore
     HAS_DND = True
 except Exception:
     HAS_DND = False
@@ -30,14 +32,14 @@ MEASURE_ITEMS = [
     ("useful", "Usefulness (1–7): The AI ranking was useful."),
 ]
 
-# Order fixed (swapped): Advisory -> Full -> Semi
+# Fixed order (swapped): Advisory -> Full -> Semi
 MODES = [
     ("advisory", "Advisory: You rank first, then AI advises"),
     ("full", "Fully automated: AI decides (locked)"),
     ("semi", "Semi-automated: AI ranks first, you may modify"),
 ]
 
-# Broad task pool
+# Broad task pool (population-relevant; no "supervisor")
 TASK_POOL = [
     "Pay a bill that is due soon",
     "Reply to an important message",
@@ -73,12 +75,16 @@ TASK_POOL = [
     "Pay rent / transfer money on time",
     "Update a document due in a few days",
     "Finish a small errand before stores close",
+    "Confirm an appointment time and location",
+    "Make a decision for something expiring soon",
+    "Follow up on a payment that didn’t go through",
+    "Handle an urgent household issue (water/electricity) today",
 ]
 
-TASKS_PER_STEP = 5
+TASKS_PER_PARTICIPANT = 5
 TOTAL_STEPS = 3
 
-# Optional CSV log
+# Optional CSV log (local to Streamlit server; on Streamlit Cloud it is NOT persistent long-term)
 LOG_PATH = "logs.csv"
 LOG_HEADER = [
     "timestamp_utc",
@@ -139,6 +145,12 @@ def kendall_tau_distance(order1, order2):
     return inv
 
 def _sanitize_ranking(ranking, n: int):
+    """
+    Robustly convert whatever the model returned into a valid permutation 0..n-1.
+    - Remove duplicates
+    - Remove non-ints/out-of-range
+    - Fill missing in natural order
+    """
     if not isinstance(ranking, list):
         return list(range(n)), True
 
@@ -153,54 +165,54 @@ def _sanitize_ranking(ranking, n: int):
 
     missing = [i for i in range(n) if i not in seen]
     fixed = cleaned + missing
+
     repaired = (sorted(fixed) != list(range(n)))
     return fixed, repaired
 
-def _sanitize_reasons_rank_order(reasons, n: int):
-    """
-    Reasons MUST be aligned to ranking positions:
-      reasons[0] explains ranking[0], etc.
-    """
-    if not isinstance(reasons, list):
-        reasons = [""] * n
-        return reasons, True
+def _tokenize_keywords(task: str):
+    stop = {
+        "the","a","an","to","for","of","and","or","in","on","by","with","before",
+        "is","are","was","were","be","been","this","that","today","tomorrow",
+        "soon","needed","no","deadline","due"
+    }
+    cleaned = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in task)
+    words = [w for w in cleaned.split() if len(w) >= 4 and w not in stop]
+    uniq = []
+    for w in words:
+        if w not in uniq:
+            uniq.append(w)
+    return uniq[:4]
 
-    fixed = [str(x) for x in reasons[:n]]
-    if len(fixed) < n:
-        fixed.extend([""] * (n - len(fixed)))
-    repaired = (len(fixed) != n)
-    return fixed, repaired
+def _reason_matches_task(reason: str, task: str) -> bool:
+    r = (reason or "").lower()
+    kws = _tokenize_keywords(task)
+    if not kws:
+        return True
+    return any(k in r for k in kws)
 
 # =========================
-# GROQ
+# GROQ: 2-call approach (ranking then reasons-by-id, with validation/repair)
 # =========================
 def groq_rank_tasks(tasks):
     api_key = st.secrets.get("GROQ_API_KEY", None)
     if not api_key:
         raise RuntimeError("Missing GROQ_API_KEY in Streamlit secrets.")
-
     client = Groq(api_key=api_key)
+
     n = len(tasks)
 
-    prompt = f"""
+    # ---- Call 1: ranking only (easier to validate) ----
+    prompt_rank = f"""
 You are ranking tasks using a fixed rubric:
 1) Urgency (time-sensitive, soonest deadline)
 2) Importance (high impact, consequences if delayed)
 3) Deadline proximity (explicit deadlines beat vague ones)
 Tie-break: clearer negative consequences if delayed.
 
-Return ONLY valid JSON (no markdown, no extra text).
-
-IMPORTANT OUTPUT FORMAT:
-- "ranking" MUST be a permutation of 0..{n-1} (each exactly once), highest priority first.
-- "reasons" MUST be a list of length {n}, where reasons[j] explains the task at ranking position j.
-  (So reasons[0] explains ranking[0], reasons[1] explains ranking[1], etc.)
-- Each reason must be <= 12 words and include a concrete time cue if possible.
-
+Return ONLY valid JSON.
 JSON schema:
 {{
-  "ranking": [int, ...],
-  "reasons": [string, ...]
+  "ranking": [int, ...]  // permutation of 0..{n-1}, highest priority first
 }}
 
 Tasks (index = task id):
@@ -211,41 +223,107 @@ Tasks (index = task id):
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": "Output JSON only. No prose. No markdown."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": prompt_rank},
         ],
         temperature=0.0,
     )
 
     data = safe_extract_json(resp.choices[0].message.content)
-    ranking = data.get("ranking")
-    reasons = data.get("reasons")
+    ranking_raw = data.get("ranking")
+    ranking, repaired = _sanitize_ranking(ranking_raw, n)
 
-    fixed_ranking, repaired_rank = _sanitize_ranking(ranking, n)
-    fixed_reasons, repaired_reasons = _sanitize_reasons_rank_order(reasons, n)
-
-    # Retry once if ranking is invalid (main critical issue)
-    if repaired_rank:
-        retry_prompt = prompt + "\n\nYour previous ranking was invalid. Return a correct permutation now."
+    # Retry once if ranking needed repair
+    if repaired:
         resp2 = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": "Output JSON only. No prose. No markdown."},
-                {"role": "user", "content": retry_prompt},
+                {"role": "user", "content": prompt_rank + "\n\nYour previous ranking was invalid. Return a correct permutation."},
             ],
             temperature=0.0,
         )
         data2 = safe_extract_json(resp2.choices[0].message.content)
-        ranking2 = data2.get("ranking")
-        reasons2 = data2.get("reasons")
+        ranking2, repaired2 = _sanitize_ranking(data2.get("ranking"), n)
+        if not repaired2:
+            ranking = ranking2
 
-        fixed_ranking2, repaired_rank2 = _sanitize_ranking(ranking2, n)
-        fixed_reasons2, _ = _sanitize_reasons_rank_order(reasons2, n)
+    # ---- Call 2: reasons per task-id (prevents cross-task leakage) ----
+    prompt_reasons = f"""
+Write ONE short reason per task, using the SAME rubric.
+Rules:
+- One reason per task-id.
+- Do NOT mention any other task.
+- If the task has a time cue (today/tomorrow/closing/due/this week/etc.), include it.
+- Keep each reason <= 14 words.
 
-        if not repaired_rank2:
-            fixed_ranking = fixed_ranking2
-            fixed_reasons = fixed_reasons2
+Return ONLY JSON:
+{{
+  "reasons_by_id": [string, ...]  // length {n}; reasons_by_id[i] explains task i
+}}
 
-    return {"ranking": fixed_ranking, "reasons": fixed_reasons}
+Tasks:
+{json.dumps(tasks, ensure_ascii=False)}
+""".strip()
+
+    resp_r = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "Output JSON only. No prose. No markdown."},
+            {"role": "user", "content": prompt_reasons},
+        ],
+        temperature=0.0,
+    )
+    data_r = safe_extract_json(resp_r.choices[0].message.content)
+    reasons = data_r.get("reasons_by_id")
+
+    if not isinstance(reasons, list):
+        reasons = [""] * n
+    reasons = [str(x) for x in reasons[:n]]
+    if len(reasons) < n:
+        reasons.extend([""] * (n - len(reasons)))
+
+    # ---- Validate reasons match their task; repair only the broken ones ----
+    bad_ids = [i for i in range(n) if not _reason_matches_task(reasons[i], tasks[i])]
+
+    if bad_ids:
+        subset = [{"id": i, "task": tasks[i]} for i in bad_ids]
+        prompt_repair = f"""
+For EACH item below, write a short reason for THAT task only.
+Rules:
+- Do NOT mention any other task.
+- Include a time cue if present in the task.
+- <= 14 words.
+
+Return ONLY JSON:
+{{
+  "reasons_patch": {{ "id": "reason", ... }}
+}}
+
+Items:
+{json.dumps(subset, ensure_ascii=False)}
+""".strip()
+
+        resp_fix = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": "Output JSON only. No prose. No markdown."},
+                {"role": "user", "content": prompt_repair},
+            ],
+            temperature=0.0,
+        )
+        data_fix = safe_extract_json(resp_fix.choices[0].message.content)
+        patch = data_fix.get("reasons_patch", {})
+
+        if isinstance(patch, dict):
+            for k, v in patch.items():
+                try:
+                    i = int(k)
+                    if 0 <= i < n:
+                        reasons[i] = str(v)
+                except Exception:
+                    pass
+
+    return {"ranking": ranking, "reasons_by_id": reasons}
 
 # =========================
 # SESSION INIT
@@ -255,28 +333,34 @@ def init():
         st.session_state.participant_id = str(uuid.uuid4())[:8]
 
     if "mode_order" not in st.session_state:
-        st.session_state.mode_order = MODES[:]  # fixed order (swapped)
+        st.session_state.mode_order = MODES[:]  # fixed order
 
     if "step" not in st.session_state:
         st.session_state.step = 0
 
-    if "tasks_by_step" not in st.session_state:
-        st.session_state.tasks_by_step = {}
+    # Fixed tasks PER participant (same tasks across all 3 stages for that participant)
+    if "tasks_fixed" not in st.session_state:
+        rng = random.Random(f"{st.session_state.participant_id}-fixed")
+        st.session_state.tasks_fixed = rng.sample(TASK_POOL, TASKS_PER_PARTICIPANT)
 
+    # Per-step state
     if "t_step_start" not in st.session_state:
         st.session_state.t_step_start = None
     if "t_ai_shown" not in st.session_state:
         st.session_state.t_ai_shown = None
+
     if "ai_order" not in st.session_state:
         st.session_state.ai_order = None
-    if "reasons" not in st.session_state:
-        st.session_state.reasons = None
+    if "reasons_by_id" not in st.session_state:
+        st.session_state.reasons_by_id = None
+
     if "user_order" not in st.session_state:
         st.session_state.user_order = None
 
     if "advisory_ready_for_ai" not in st.session_state:
         st.session_state.advisory_ready_for_ai = False
 
+    # Track if AI already generated for this step
     if "ai_generated_step_idx" not in st.session_state:
         st.session_state.ai_generated_step_idx = None
 
@@ -285,11 +369,13 @@ def init():
     if "accepted_ai_as_is" not in st.session_state:
         st.session_state.accepted_ai_as_is = False
 
+    # Downloadable JSON records
     if "records" not in st.session_state:
         st.session_state.records = {
             "participant_id": st.session_state.participant_id,
-            "mode_order": None,
-            "steps": []
+            "mode_order": [m[0] for m in st.session_state.mode_order],
+            "tasks_fixed": st.session_state.tasks_fixed,
+            "steps": [],
         }
 
     if "done" not in st.session_state:
@@ -297,22 +383,8 @@ def init():
 
 init()
 
-if st.session_state.records["mode_order"] is None:
-    st.session_state.records["mode_order"] = [m[0] for m in st.session_state.mode_order]
-
 # =========================
-# TASKS per step
-# =========================
-def get_tasks_for_step(pid: str, step_idx: int):
-    if step_idx in st.session_state.tasks_by_step:
-        return st.session_state.tasks_by_step[step_idx]
-    rng = random.Random(f"{pid}-{step_idx}")
-    tasks = rng.sample(TASK_POOL, TASKS_PER_STEP)
-    st.session_state.tasks_by_step[step_idx] = tasks
-    return tasks
-
-# =========================
-# AI generation
+# AI generation (once per step)
 # =========================
 def ensure_ai_generated(tasks, step_idx):
     if st.session_state.ai_generated_step_idx == step_idx and st.session_state.ai_order is not None:
@@ -320,14 +392,14 @@ def ensure_ai_generated(tasks, step_idx):
     out = groq_rank_tasks(tasks)
     st.session_state.t_ai_shown = time.time()
     st.session_state.ai_order = out["ranking"]
-    st.session_state.reasons = out["reasons"]  # reasons are aligned to ranking positions
+    st.session_state.reasons_by_id = out["reasons_by_id"]
     st.session_state.ai_generated_step_idx = step_idx
 
 # =========================
 # UI
 # =========================
 st.title("Everyday Task Prioritization Study")
-st.caption("Three steps. 5 tasks per step. Only control level changes. (Order: Advisory → Full → Semi)")
+st.caption("Same 5 tasks for all 3 steps (per participant). Only control level changes. (Order: Advisory → Full → Semi)")
 
 with st.expander("Rubric used by the AI (same in all modes)", expanded=False):
     st.markdown(
@@ -365,7 +437,7 @@ if st.session_state.done:
 # Step context
 step_idx = st.session_state.step
 mode_key, mode_label = st.session_state.mode_order[step_idx]
-tasks = get_tasks_for_step(st.session_state.participant_id, step_idx)
+tasks = st.session_state.tasks_fixed[:]  # SAME tasks in all stages for this participant
 n = len(tasks)
 
 st.progress((step_idx + 1) / TOTAL_STEPS)
@@ -381,7 +453,8 @@ if st.session_state.user_order is None:
 if mode_key in ("full", "semi"):
     try:
         ensure_ai_generated(tasks, step_idx)
-        if mode_key == "semi" and (st.session_state.user_order == list(range(n))):
+        # Semi: prefill user's ranking with AI ranking (only first time on this step)
+        if mode_key == "semi" and st.session_state.user_order == list(range(n)):
             st.session_state.user_order = st.session_state.ai_order[:]
             st.session_state.accepted_ai_as_is = True
     except Exception as e:
@@ -389,7 +462,9 @@ if mode_key in ("full", "semi"):
 
 left, right = st.columns([1, 1], gap="large")
 
+# -------------------------
 # LEFT: AI recommendation
+# -------------------------
 with left:
     st.markdown("### AI recommendation")
 
@@ -408,11 +483,10 @@ with left:
             if show_reasons:
                 st.session_state.viewed_reasons = True
 
+            reasons_by_id = st.session_state.reasons_by_id or [""] * n
             for rank_pos, idx in enumerate(st.session_state.ai_order, start=1):
                 if show_reasons:
-                    # reasons aligned to ranking positions
-                    reason = st.session_state.reasons[rank_pos - 1]
-                    st.write(f"{rank_pos}. {tasks[idx]} — {reason}")
+                    st.write(f"{rank_pos}. {tasks[idx]} — {reasons_by_id[idx]}")
                 else:
                     st.write(f"{rank_pos}. {tasks[idx]}")
 
@@ -422,7 +496,9 @@ with left:
                     st.session_state.accepted_ai_as_is = True
                     st.rerun()
 
+# -------------------------
 # RIGHT: User ranking
+# -------------------------
 with right:
     st.markdown("### Your ranking")
 
@@ -459,17 +535,22 @@ with right:
             for pos, idx in enumerate(st.session_state.user_order, start=1):
                 st.markdown(f"<div class='card'>{pos}. {tasks[idx]}</div>", unsafe_allow_html=True)
     else:
-        if HAS_DND:
+        dnd_ok = HAS_DND
+        if dnd_ok:
             label_by_idx = {i: f"{i}. {tasks[i]}" for i in range(n)}
             current_labels = [label_by_idx[i] for i in st.session_state.user_order]
-            sorted_labels = sort_items(
-                current_labels,
-                direction="vertical",
-                key=f"dnd_{step_idx}",
-            )
-            inv = {v: k for k, v in label_by_idx.items()}
-            st.session_state.user_order = [inv[x] for x in sorted_labels]
-        else:
+            try:
+                sorted_labels = sort_items(
+                    current_labels,
+                    direction="vertical",
+                    key=f"dnd_{step_idx}",
+                )
+                inv = {v: k for k, v in label_by_idx.items()}
+                st.session_state.user_order = [inv[x] for x in sorted_labels]
+            except Exception:
+                dnd_ok = False
+
+        if not dnd_ok:
             order = st.session_state.user_order
             for pos, idx in enumerate(order):
                 row = st.columns([8, 1, 1])
@@ -485,12 +566,15 @@ with right:
                     st.session_state.accepted_ai_as_is = False
                     st.rerun()
 
+        # Advisory gating
         if mode_key == "advisory" and not st.session_state.advisory_ready_for_ai:
             if st.button("Reveal AI advice (I finished my initial ranking)"):
                 st.session_state.advisory_ready_for_ai = True
                 st.rerun()
 
+# -------------------------
 # Status
+# -------------------------
 st.divider()
 ai_order = st.session_state.ai_order
 final_order = st.session_state.user_order
@@ -503,7 +587,9 @@ else:
     st.info(f"Difference from AI: {kdist} (Kendall inversions) | Position mismatches: {moves_count}")
     st.session_state.accepted_ai_as_is = (final_order == ai_order)
 
+# -------------------------
 # Questionnaire
+# -------------------------
 st.subheader("Quick questions for this step (10–15 seconds)")
 
 satisfaction = st.slider(
@@ -529,7 +615,9 @@ if mode_key == "advisory":
 if mode_key == "full":
     attention_ack = st.checkbox("I have reviewed the ranking.", key=f"ack_seen_{step_idx}")
 
+# -------------------------
 # Submit
+# -------------------------
 submit_disabled = False
 if mode_key == "advisory" and not advisory_ack:
     submit_disabled = True
@@ -550,46 +638,52 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
     moves_count = sum(1 for i in range(n) if final_order[i] != ai_order[i])
     kdist = kendall_tau_distance(ai_order, final_order)
     accepted = int(bool(final_order == ai_order))
+    viewed = int(bool(st.session_state.viewed_reasons))
 
-    append_log([
-        datetime.utcnow().isoformat(),
-        st.session_state.participant_id,
-        step_idx + 1,
-        mode_key,
-        json.dumps(tasks, ensure_ascii=False),
-        json.dumps(ai_order),
-        json.dumps(final_order),
-        round(time_to_ai, 3),
-        round(decision_time, 3),
-        round(time_to_submit, 3),
-        moves_count,
-        kdist,
-        accepted,
-        int(bool(st.session_state.viewed_reasons)),
-        manipulation,
-        satisfaction,
-        answers["trust"],
-        answers["control"],
-        answers["responsibility"],
-        answers["effort"],
-        answers["useful"],
-    ])
+    # Optional CSV logging (best-effort)
+    try:
+        append_log([
+            datetime.utcnow().isoformat(),
+            st.session_state.participant_id,
+            step_idx + 1,
+            mode_key,
+            json.dumps(tasks, ensure_ascii=False),
+            json.dumps(ai_order),
+            json.dumps(final_order),
+            round(time_to_ai, 3),
+            round(decision_time, 3),
+            round(time_to_submit, 3),
+            moves_count,
+            kdist,
+            accepted,
+            viewed,
+            manipulation,
+            satisfaction,
+            answers["trust"],
+            answers["control"],
+            answers["responsibility"],
+            answers["effort"],
+            answers["useful"],
+        ])
+    except Exception:
+        pass
 
+    # Save into downloadable participant JSON
     st.session_state.records["steps"].append({
         "timestamp_utc": datetime.utcnow().isoformat(),
         "step": step_idx + 1,
         "mode": mode_key,
         "tasks": tasks,
         "ai_order": ai_order,
+        "ai_reasons_by_id": (st.session_state.reasons_by_id or [""] * n),
         "final_order": final_order,
-        "ai_reasons_rank_order": st.session_state.reasons,  # aligned to ranking positions
         "time_to_ai_sec": round(time_to_ai, 3),
         "decision_time_sec": round(decision_time, 3),
         "time_to_submit_sec": round(time_to_submit, 3),
         "moves_count": moves_count,
         "kendall_tau_to_ai": kdist,
         "accepted_ai_as_is": bool(accepted),
-        "viewed_reasons": bool(st.session_state.viewed_reasons),
+        "viewed_reasons": bool(viewed),
         "manipulation_check": manipulation,
         "satisfaction_1to7": satisfaction,
         "trust_1to7": answers["trust"],
@@ -599,13 +693,14 @@ if st.button("Confirm & Next", type="primary", disabled=submit_disabled):
         "useful_1to7": answers["useful"],
     })
 
+    # Advance step
     st.session_state.step += 1
 
-    # Reset per-step state
+    # Reset per-step UI state
     st.session_state.t_step_start = None
     st.session_state.t_ai_shown = None
     st.session_state.ai_order = None
-    st.session_state.reasons = None
+    st.session_state.reasons_by_id = None
     st.session_state.user_order = None
     st.session_state.viewed_reasons = False
     st.session_state.accepted_ai_as_is = False
